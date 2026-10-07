@@ -119,6 +119,7 @@ Outliers and Influence
    :toctree: generated/
 
    OLSInfluence
+   OLSGroupInfluence
    GLMInfluence
    MLEInfluence
    variance_inflation_factor

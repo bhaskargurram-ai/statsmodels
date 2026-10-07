@@ -15,7 +15,7 @@ import warnings
 import numpy as np
 
 from statsmodels.graphics._regressionplots_doc import _plot_influence_doc
-from statsmodels.regression.linear_model import OLS
+from statsmodels.regression.linear_model import OLS, WLS
 from statsmodels.stats.multitest import multipletests
 from statsmodels.tools._decorators import cache_readonly
 from statsmodels.tools.docstring_helpers import Appender
@@ -1761,3 +1761,317 @@ class GLMInfluence(MLEInfluence):
             # alias for now
             "det_cov_params": det_cov_params,
         }
+
+
+class OLSGroupInfluence:
+    r"""
+    Leave-one-group-out influence measures for OLS and WLS results
+
+    All observations that share a group label are deleted together, e.g.
+    the observations of one cluster or of one individual in panel data.
+    The measures are the multiple deletion analogues of the leave-one-
+    observation-out measures in :class:`OLSInfluence`, and they are equal to
+    those if every group has a single observation.
+
+    Parameters
+    ----------
+    results : RegressionResults
+        Results instance of an OLS or WLS model.
+    groups : array_like
+        One-dimensional array with a group label for each observation used
+        in the estimation, i.e. after missing values have been removed.
+
+    Attributes
+    ----------
+    group_labels : ndarray
+        The sorted unique group labels. Group level measures are in this
+        order.
+    n_groups : int
+        The number of groups.
+    nobs_group : ndarray
+        The number of observations in each group.
+
+    See Also
+    --------
+    OLSInfluence
+        Leave-one-observation-out influence measures.
+
+    Notes
+    -----
+    For WLS all computations use the whitened variables
+    :math:`W^{1/2} X` and :math:`W^{1/2} y`, which replace :math:`X` and
+    :math:`y` in the following. Let
+    :math:`X_g` and :math:`e_g` be the rows of the design matrix and the
+    residuals of group :math:`g`, and :math:`H_{gg} = X_g (X'X)^{-1} X_g'`
+    the corresponding block of the hat matrix. Deleting group :math:`g`
+    changes the parameter estimates and the residual sum of squares by
+
+    .. math::
+
+       \hat\beta - \hat\beta_{(g)} = (X'X)^{-1} X_g' (I - H_{gg})^{-1} e_g
+
+       SSR - SSR_{(g)} = e_g' (I - H_{gg})^{-1} e_g
+
+    see e.g. Cook and Weisberg (1982), chapter 3. With the QR decomposition
+    :math:`X = QR` these are computed from the :math:`k \times k` matrices
+    :math:`I - Q_g'Q_g`, which have the same determinant and the same
+    eigenvalues different from one as :math:`I - H_{gg}`. No auxiliary
+    regressions are estimated, except for groups whose deletion makes the
+    design matrix rank deficient, i.e. :math:`I - H_{gg}` is numerically
+    singular. This happens for example if the model includes group specific
+    fixed effects. Those groups are refit with the pseudo-inverse, and a
+    ``SingularMatrixWarning`` is issued because their parameters are not
+    identified. If the design matrix of the full sample is rank deficient,
+    then all groups are refit.
+
+    The measures based on the covariance of the parameter estimates,
+    ``dfbetas``, ``cooks_distance`` and ``cov_ratio``, use the nonrobust
+    covariance ``scale * normalized_cov_params`` also if the results have a
+    robust ``cov_type``.
+
+    References
+    ----------
+    .. [*] Cook, R. D., and S. Weisberg (1982). Residuals and Influence in
+       Regression. New York: Chapman and Hall.
+    .. [*] Belsley, D. A., E. Kuh, and R. E. Welsch (1980). Regression
+       Diagnostics. New York: Wiley.
+
+    Examples
+    --------
+    >>> import numpy as np
+    >>> import statsmodels.api as sm
+    >>> from statsmodels.stats.outliers_influence import OLSGroupInfluence
+    >>> rng = np.random.default_rng(0)
+    >>> groups = np.repeat(np.arange(10), 5)
+    >>> exog = sm.add_constant(rng.standard_normal(50))
+    >>> endog = exog.sum(1) + rng.standard_normal(10)[groups]
+    >>> res = sm.OLS(endog, exog).fit()
+    >>> infl = OLSGroupInfluence(res, groups)
+    >>> frame = infl.summary_frame()
+    """
+
+    def __init__(self, results, groups):
+        self.results = results = maybe_unwrap_results(results)
+        if not isinstance(results.model, WLS):
+            raise NotImplementedError(
+                "OLSGroupInfluence is only available for OLS and WLS results"
+            )
+        self.nobs, self.k_vars = results.model.exog.shape
+        groups = np.asarray(groups)
+        if groups.shape != (self.nobs,):
+            raise ValueError(
+                "groups must be one-dimensional with one label for each "
+                "observation used in the model"
+            )
+        self.group_labels, self._group_idx, self.nobs_group = np.unique(
+            groups, return_inverse=True, return_counts=True
+        )
+        self.n_groups = len(self.group_labels)
+
+    @cache_readonly
+    def hat_matrix_trace(self):
+        """
+        Trace of the diagonal block of the hat matrix for each group
+
+        This is the sum of the hat matrix diagonal of the observations in
+        the group, the group leverage.
+        """
+        model = self.results.model
+        hii = (model.wexog * model.pinv_wexog.T).sum(1)
+        return np.bincount(self._group_idx, weights=hii, minlength=self.n_groups)
+
+    @cache_readonly
+    def _res_logo(self):
+        """
+        Results of the leave-one-group-out regressions
+
+        Contains 'params', 'mse_resid' and 'det_cov_params' for each group.
+        """
+        results = self.results
+        model = results.model
+        wexog = model.wexog
+        wresid = np.asarray(results.wresid)
+        k = self.k_vars
+        df_resid = results.df_resid - self.nobs_group
+
+        params = np.empty((self.n_groups, k))
+        mse_resid = np.empty(self.n_groups)
+        det_cov_params = np.empty(self.n_groups)
+        refit = np.ones(self.n_groups, dtype=bool)
+
+        if model.rank == k:
+            q, r = np.linalg.qr(wexog)
+            r_inv = np.linalg.solve(r, np.eye(k))
+            det_ncov = np.linalg.det(results.normalized_cov_params)
+            tol = np.sqrt(np.finfo(float).eps)
+            # observations sorted by group, groups of the same size are
+            # processed together
+            order = np.argsort(self._group_idx, kind="stable")
+            starts = np.cumsum(self.nobs_group) - self.nobs_group
+            for size in np.unique(self.nobs_group):
+                gidx = np.flatnonzero(self.nobs_group == size)
+                obs = order[starts[gidx][:, None] + np.arange(size)]
+                q_g = q[obs]
+                e_g = wresid[obs]
+                # I - Q_g'Q_g has the same non-unit eigenvalues as I - H_gg
+                eigvals, eigvecs = np.linalg.eigh(
+                    np.eye(k) - q_g.transpose(0, 2, 1) @ q_g
+                )
+                ok = eigvals[:, 0] > tol
+                c = np.einsum("msk,ms->mk", q_g[ok], e_g[ok])
+                v = eigvecs[ok]
+                # z = (I - Q_g'Q_g)^{-1} Q_g'e_g
+                z = np.einsum(
+                    "mij,mj->mi", v, np.einsum("mji,mj->mi", v, c) / eigvals[ok]
+                )
+                gidx = gidx[ok]
+                params[gidx] = np.asarray(results.params) - z @ r_inv.T
+                ssr_g = results.ssr - (e_g[ok] ** 2).sum(1) - (c * z).sum(1)
+                mse_resid[gidx] = ssr_g / df_resid[gidx]
+                # det(X_(g)'X_(g)) = det(X'X) det(I - H_gg)
+                det_cov_params[gidx] = (
+                    mse_resid[gidx] ** k * det_ncov / eigvals[ok].prod(1)
+                )
+                refit[gidx] = False
+
+            if refit.any():
+                warnings.warn(
+                    f"Deleting {refit.sum()} of the groups makes the design "
+                    "matrix rank deficient. The parameters for these groups "
+                    "are not identified and are computed with the "
+                    "pseudo-inverse.",
+                    SingularMatrixWarning,
+                    stacklevel=2,
+                )
+
+        wendog = model.wendog
+        for g in np.flatnonzero(refit):
+            mask = self._group_idx != g
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", SingularMatrixWarning)
+                res_g = OLS(wendog[mask], wexog[mask]).fit()
+            params[g] = res_g.params
+            mse_resid[g] = res_g.mse_resid
+            det_cov_params[g] = np.linalg.det(res_g.cov_params())
+
+        return {
+            "params": params,
+            "mse_resid": mse_resid,
+            "det_cov_params": det_cov_params,
+        }
+
+    @property
+    def params_not_group(self):
+        """
+        Parameter estimates when the group is deleted
+
+        Array with one row for each group.
+        """
+        return self._res_logo["params"]
+
+    @property
+    def sigma2_not_group(self):
+        """
+        Error variance, ``mse_resid``, when the group is deleted
+        """
+        return self._res_logo["mse_resid"]
+
+    @property
+    def det_cov_params_not_group(self):
+        """
+        Determinant of the nonrobust ``cov_params`` when the group is deleted
+        """
+        return self._res_logo["det_cov_params"]
+
+    @cache_readonly
+    def d_params(self):
+        """
+        Change in parameter estimates when the group is deleted
+
+        ``params - params_not_group``. This is exact for OLS and WLS.
+        """
+        return np.asarray(self.results.params) - self.params_not_group
+
+    @property
+    def dfbeta(self):
+        """
+        Change in parameter estimates when the group is deleted
+
+        Alias for ``d_params`` for consistency with ``OLSInfluence``.
+        """
+        return self.d_params
+
+    @cache_readonly
+    def dfbetas(self):
+        """
+        Scaled change in parameter estimates when the group is deleted
+
+        ``d_params`` is divided by the standard errors of the parameters
+        using the error variance ``sigma2_not_group`` of the regression
+        without the group.
+        """
+        bse = np.sqrt(
+            self.sigma2_not_group[:, None] * np.diag(self.results.normalized_cov_params)
+        )
+        return self.d_params / bse
+
+    @cache_readonly
+    def cooks_distance(self):
+        """
+        Cook's distance for deleting a group and p-values
+
+        Returns
+        -------
+        cooks_d : ndarray
+            Cook's distance for each group, the quadratic form
+            ``d_params' X'X d_params`` divided by ``k_vars * scale``.
+        pvalues : ndarray
+            p-values based on the F-distribution with ``k_vars`` and
+            ``df_resid`` degrees of freedom.
+        """
+        from scipy import stats
+
+        wexog = self.results.model.wexog
+        xtx = wexog.T @ wexog
+        cooks_d = (self.d_params @ xtx * self.d_params).sum(1)
+        cooks_d /= self.k_vars * self.results.scale
+        pvals = stats.f.sf(cooks_d, self.k_vars, self.results.df_resid)
+        return cooks_d, pvals
+
+    @cache_readonly
+    def cov_ratio(self):
+        """
+        Ratio of the determinants of cov_params without and with the group
+
+        This uses the nonrobust covariance of the parameter estimates.
+        """
+        det_cov = np.linalg.det(self.results.scale * self.results.normalized_cov_params)
+        return self.det_cov_params_not_group / det_cov
+
+    def summary_frame(self):
+        """
+        Create a DataFrame with the leave-one-group-out influence measures
+
+        Returns
+        -------
+        DataFrame
+            A DataFrame with one row for each group, indexed by
+            ``group_labels``. It contains the ``dfbetas`` with column names
+            ``dfb_`` plus the name of the explanatory variable, and the
+            columns
+
+            * nobs : the number of observations in the group
+            * hat_trace : ``hat_matrix_trace``
+            * cooks_d : Cook's distance defined in ``cooks_distance``
+            * cov_ratio : ``cov_ratio``
+        """
+        from pandas import DataFrame, Index
+
+        index = Index(self.group_labels, name="group")
+        beta_labels = ["dfb_" + i for i in self.results.model.data.xnames]
+        frame = DataFrame(self.dfbetas, columns=beta_labels, index=index)
+        frame["nobs"] = self.nobs_group
+        frame["hat_trace"] = self.hat_matrix_trace
+        frame["cooks_d"] = self.cooks_distance[0]
+        frame["cov_ratio"] = self.cov_ratio
+        return frame

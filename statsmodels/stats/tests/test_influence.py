@@ -15,7 +15,7 @@ import pytest
 
 from statsmodels.genmod import families
 from statsmodels.genmod.generalized_linear_model import GLM
-from statsmodels.regression.linear_model import OLS
+from statsmodels.regression.linear_model import OLS, WLS
 from statsmodels.stats.outliers_influence import (
     GLMInfluence,
     MLEInfluence,
@@ -555,3 +555,241 @@ def test_olsinfluence_looo_loop_matches_closed_form():
     )
     assert_allclose(infl_loop.dfbetas, infl_closed.dfbetas, rtol=1e-10)
     assert_allclose(infl_loop.cov_ratio, infl_closed.cov_ratio, rtol=1e-10)
+
+
+def _logo_brute_force(endog, exog, groups, weights=None):
+    # explicit leave-one-group-out regressions
+    from scipy import stats
+
+    weights = np.ones(len(endog)) if weights is None else weights
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SingularMatrixWarning)
+        res = WLS(endog, exog, weights=weights).fit()
+    wexog = exog * np.sqrt(weights)[:, None]
+    hat = wexog @ np.linalg.pinv(wexog)
+    k = exog.shape[1]
+    out = {"params": [], "mse_resid": [], "det_cov_params": [], "hat_trace": []}
+    for g in np.unique(groups):
+        mask = groups != g
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SingularMatrixWarning)
+            res_g = WLS(endog[mask], exog[mask], weights=weights[mask]).fit()
+        out["params"].append(res_g.params)
+        out["mse_resid"].append(res_g.mse_resid)
+        out["det_cov_params"].append(np.linalg.det(res_g.cov_params()))
+        out["hat_trace"].append(np.trace(hat[~mask][:, ~mask]))
+    out = {key: np.array(val) for key, val in out.items()}
+    d_params = res.params - out["params"]
+    out["d_params"] = d_params
+    out["dfbetas"] = d_params / np.sqrt(
+        out["mse_resid"][:, None] * np.diag(res.normalized_cov_params)
+    )
+    # Cook's distance for deleting a set of observations
+    cooks_d = np.einsum("gi,ij,gj->g", d_params, wexog.T @ wexog, d_params)
+    cooks_d /= k * res.scale
+    out["cooks_distance"] = (cooks_d, stats.f.sf(cooks_d, k, res.df_resid))
+    out["cov_ratio"] = out["det_cov_params"] / np.linalg.det(res.cov_params())
+    return res, out
+
+
+def _check_logo(infl, expected):
+    assert_allclose(infl.params_not_group, expected["params"], rtol=1e-10)
+    assert_allclose(infl.sigma2_not_group, expected["mse_resid"], rtol=1e-10)
+    assert_allclose(
+        infl.det_cov_params_not_group, expected["det_cov_params"], rtol=1e-10
+    )
+    assert_allclose(infl.hat_matrix_trace, expected["hat_trace"], rtol=1e-10)
+    assert_allclose(infl.d_params, expected["d_params"], rtol=1e-10, atol=1e-12)
+    assert_allclose(infl.dfbeta, expected["d_params"], rtol=1e-10, atol=1e-12)
+    assert_allclose(infl.dfbetas, expected["dfbetas"], rtol=1e-10, atol=1e-12)
+    assert_allclose(
+        infl.cooks_distance, expected["cooks_distance"], rtol=1e-10, atol=1e-14
+    )
+    assert_allclose(infl.cov_ratio, expected["cov_ratio"], rtol=1e-10)
+
+
+# no auxiliary regressions are needed if no group deletion is singular
+@pytest.mark.filterwarnings(
+    "error::statsmodels.tools.sm_exceptions.SingularMatrixWarning"
+)
+@pytest.mark.parametrize("weighted", [False, True])
+@pytest.mark.parametrize("design", ["balanced", "unbalanced", "singletons"])
+def test_olsgroupinfluence_brute_force(weighted, design):
+    # GH#7924
+    from statsmodels.stats.outliers_influence import OLSGroupInfluence
+
+    rng = np.random.default_rng(7924)
+    if design == "balanced":
+        groups = np.repeat(np.arange(12), 5)
+    elif design == "unbalanced":
+        sizes = [1, 1, 2, 3, 4, 4, 6, 8, 9, 10, 12]
+        groups = np.repeat(np.arange(len(sizes)), sizes)
+    else:
+        groups = np.repeat(np.arange(9), [10, 10, 10, 10, 1, 1, 1, 1, 1])
+    n = len(groups)
+    # groups need not be sorted
+    groups = rng.permutation(groups)
+    exog = np.column_stack([np.ones(n), rng.standard_normal((n, 3))])
+    exog[:3, 1] *= 10  # a few high leverage observations
+    endog = exog @ [1.0, 0.5, -0.5, 0.2] + rng.standard_normal(n)
+    endog += rng.standard_normal(groups.max() + 1)[groups]
+    weights = rng.uniform(0.5, 3, n) if weighted else None
+
+    res, expected = _logo_brute_force(endog, exog, groups, weights)
+    if not weighted:
+        res = OLS(endog, exog).fit()
+    infl = OLSGroupInfluence(res, groups)
+    assert infl.n_groups == groups.max() + 1
+    assert_allclose(infl.nobs_group, np.bincount(groups))
+    _check_logo(infl, expected)
+
+
+@pytest.mark.filterwarnings(
+    "error::statsmodels.tools.sm_exceptions.SingularMatrixWarning"
+)
+def test_olsgroupinfluence_singletons_olsinfluence():
+    # with one observation per group, leave-one-group-out is
+    # leave-one-observation-out
+    from statsmodels.stats.outliers_influence import (
+        OLSGroupInfluence,
+        OLSInfluence,
+    )
+
+    rng = np.random.default_rng(79241)
+    n = 40
+    exog = np.column_stack([np.ones(n), rng.standard_normal((n, 2))])
+    exog[:2, 2] *= 20
+    endog = exog @ [1.0, 0.5, -0.5] + rng.standard_normal(n)
+    res = OLS(endog, exog).fit()
+    infl_obs = OLSInfluence(res)
+    # labels sort in reverse order of the observations
+    infl = OLSGroupInfluence(res, n - np.arange(n))
+    rev = slice(None, None, -1)
+
+    assert_allclose(infl.params_not_group, infl_obs.params_not_obsi[rev], rtol=1e-10)
+    assert_allclose(infl.sigma2_not_group, infl_obs.sigma2_not_obsi[rev], rtol=1e-10)
+    assert_allclose(
+        infl.det_cov_params_not_group,
+        infl_obs.det_cov_params_not_obsi[rev],
+        rtol=1e-10,
+    )
+    assert_allclose(infl.hat_matrix_trace, infl_obs.hat_matrix_diag[rev], rtol=1e-10)
+    assert_allclose(infl.dfbeta, infl_obs.dfbeta[rev], rtol=1e-10)
+    assert_allclose(infl.dfbetas, infl_obs.dfbetas[rev], rtol=1e-10)
+    assert_allclose(infl.cooks_distance[0], infl_obs.cooks_distance[0][rev], rtol=1e-10)
+    assert_allclose(infl.cooks_distance[1], infl_obs.cooks_distance[1][rev], rtol=1e-10)
+    assert_allclose(infl.cov_ratio, infl_obs.cov_ratio[rev], rtol=1e-10)
+
+
+@pytest.mark.parametrize("weighted", [False, True])
+def test_olsgroupinfluence_singular_group(weighted):
+    # Deleting a group with a group specific dummy variable makes exog rank
+    # deficient. Those groups are refit, all others use the closed form.
+    from statsmodels.stats.outliers_influence import OLSGroupInfluence
+
+    rng = np.random.default_rng(79242)
+    groups = np.repeat(np.arange(8), [5, 5, 5, 5, 6, 6, 7, 1])
+    n = len(groups)
+    exog = np.column_stack(
+        [
+            np.ones(n),
+            rng.standard_normal((n, 2)),
+            groups == 2,
+            groups == 7,
+        ]
+    ).astype(float)
+    endog = exog @ [1.0, 0.5, -0.5, 1.0, 2.0] + rng.standard_normal(n)
+    weights = rng.uniform(0.5, 3, n) if weighted else None
+
+    res, expected = _logo_brute_force(endog, exog, groups, weights)
+    infl = OLSGroupInfluence(res, groups)
+    with pytest.warns(SingularMatrixWarning, match="Deleting 2 of the groups"):
+        params = infl.params_not_group
+    # the refit groups have unidentified parameters, compare only the fit
+    for g in (2, 7):
+        mask = groups != g
+        assert_allclose(
+            exog[mask] @ params[g], exog[mask] @ expected["params"][g], rtol=1e-10
+        )
+        expected["params"][g] = params[g]
+        expected["d_params"][g] = infl.d_params[g]
+        expected["dfbetas"][g] = infl.dfbetas[g]
+        expected["cooks_distance"][0][g] = infl.cooks_distance[0][g]
+        expected["cooks_distance"][1][g] = infl.cooks_distance[1][g]
+    assert_allclose(infl.det_cov_params_not_group[[2, 7]], 0, atol=1e-12)
+    _check_logo(infl, expected)
+
+
+def test_olsgroupinfluence_rank_deficient_exog():
+    # all groups are refit if the full sample exog is rank deficient
+    from statsmodels.stats.outliers_influence import OLSGroupInfluence
+
+    rng = np.random.default_rng(79243)
+    groups = np.repeat(np.arange(6), 5)
+    n = len(groups)
+    x = rng.standard_normal((n, 2))
+    exog = np.column_stack([np.ones(n), x, x.sum(1)])
+    endog = exog[:, :3] @ [1.0, 0.5, -0.5] + rng.standard_normal(n)
+    with pytest.warns(SingularMatrixWarning):
+        res = OLS(endog, exog).fit()
+    _, expected = _logo_brute_force(endog, exog, groups)
+
+    infl = OLSGroupInfluence(res, groups)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SingularMatrixWarning)
+        assert_allclose(infl.params_not_group, expected["params"], rtol=1e-10)
+    assert_allclose(infl.sigma2_not_group, expected["mse_resid"], rtol=1e-10)
+
+
+def test_olsgroupinfluence_summary_frame():
+    from statsmodels.stats.outliers_influence import OLSGroupInfluence
+
+    rng = np.random.default_rng(79244)
+    n = 30
+    df = pd.DataFrame(
+        {
+            "y": rng.standard_normal(n),
+            "x": rng.standard_normal(n),
+            "firm": rng.choice(["c", "a", "b", "d"], size=n),
+        }
+    )
+    res = OLS(df["y"], pd.DataFrame({"const": 1.0, "x": df["x"]})).fit()
+    infl = OLSGroupInfluence(res, df["firm"])
+    frame = infl.summary_frame()
+
+    assert list(frame.index) == ["a", "b", "c", "d"]
+    assert frame.index.name == "group"
+    assert list(frame.columns) == [
+        "dfb_const",
+        "dfb_x",
+        "nobs",
+        "hat_trace",
+        "cooks_d",
+        "cov_ratio",
+    ]
+    assert_allclose(frame[["dfb_const", "dfb_x"]], infl.dfbetas)
+    assert_allclose(frame["nobs"], df["firm"].value_counts().sort_index())
+    assert_allclose(frame["hat_trace"], infl.hat_matrix_trace)
+    assert_allclose(frame["cooks_d"], infl.cooks_distance[0])
+    assert_allclose(frame["cov_ratio"], infl.cov_ratio)
+
+
+def test_olsgroupinfluence_invalid():
+    from statsmodels.regression.linear_model import GLS
+    from statsmodels.stats.outliers_influence import OLSGroupInfluence
+
+    rng = np.random.default_rng(79245)
+    n = 20
+    exog = np.column_stack([np.ones(n), rng.standard_normal(n)])
+    endog = exog.sum(1) + rng.standard_normal(n)
+    res = OLS(endog, exog).fit()
+    with pytest.raises(ValueError, match="one label for each"):
+        OLSGroupInfluence(res, np.arange(n - 1))
+    with pytest.raises(ValueError, match="one label for each"):
+        OLSGroupInfluence(res, np.zeros((n, 2)))
+    res_gls = GLS(endog, exog, sigma=np.ones(n)).fit()
+    with pytest.raises(NotImplementedError):
+        OLSGroupInfluence(res_gls, np.arange(n))
+    res_glm = GLM(endog, exog).fit()
+    with pytest.raises(NotImplementedError):
+        OLSGroupInfluence(res_glm, np.arange(n))

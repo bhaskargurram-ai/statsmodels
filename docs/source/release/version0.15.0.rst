@@ -212,6 +212,10 @@ New models and statistical tests
 - Local false discovery rate estimation
   (:func:`statsmodels.stats.multitest.local_fdr_correction`), based on the
   Grenander estimator of the p-value density. :pr:`10069`
+- :class:`statsmodels.stats.outliers_influence.OLSGroupInfluence`,
+  leave-one-group-out influence measures (``dfbetas``, Cook's distance,
+  ``cov_ratio``) for OLS and WLS, e.g. for clustered or panel data, using
+  closed form group deletion updates. :issue:`7924`
 
 New and improved plots
 --------------------------
