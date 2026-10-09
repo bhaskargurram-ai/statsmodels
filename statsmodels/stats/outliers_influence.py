@@ -898,6 +898,43 @@ class OLSInfluence(_BaseInfluenceMixin):
         return self.resid * hii / (1 - hii)
 
     @cache_readonly
+    def resid_not_obsi(self):
+        """
+        Leave-one-observation-out (LOOO) residuals
+
+        Residual of observation i in the regression that drops observation
+        i, also called jackknife, deleted or predicted residuals.
+
+        Notes
+        -----
+        This uses the closed form and does not require the LOOO loop. It is
+        the same as ``resid_press``, ``resid / (1 - hii)`` where hii is the
+        diagonal of the hat matrix, and equal to
+        ``endog - fittedvalues_not_obsi``.
+        """
+        return self.resid_press
+
+    @cache_readonly
+    def fittedvalues_not_obsi(self):
+        """
+        Leave-one-observation-out (LOOO) fitted values
+
+        Prediction for observation i from the regression that drops
+        observation i.
+
+        Notes
+        -----
+        This uses the closed form and does not require the LOOO loop::
+
+           endog - resid / (1 - hii)
+
+        where hii is the diagonal of the hat matrix. The difference
+        ``fittedvalues - fittedvalues_not_obsi`` is the unscaled DFFIT, which
+        is available as ``influence``.
+        """
+        return self.endog - self.resid_press
+
+    @cache_readonly
     def hat_diag_factor(self):
         """
         Factor of diagonal of hat_matrix used in influence

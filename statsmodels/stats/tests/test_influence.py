@@ -431,6 +431,36 @@ def test_olsinfluence_closed_form_measures():
     assert_allclose(infl.resid_std, np.sqrt(infl.resid_var))
 
 
+def test_olsinfluence_looo_resid_fittedvalues():
+    # GH#9008: leave-one-observation-out residuals and fitted values.
+    # The reference values are computed by brute force: refit OLS without
+    # observation i and predict observation i. In R, resid_not_obsi is
+    # rstandard(lm(y ~ x1 + x2), type = "predictive").
+    from statsmodels.stats.outliers_influence import OLSInfluence
+
+    rng = np.random.default_rng(9008)
+    n = 40
+    exog = np.column_stack([np.ones(n), rng.standard_normal((n, 2))])
+    exog[:2, 2] *= 20  # a few high leverage observations
+    endog = exog @ [1.0, 0.5, -0.5] + rng.standard_normal(n)
+    res = OLS(endog, exog).fit()
+    infl = OLSInfluence(res)
+
+    fitted_looo = np.empty(n)
+    for i in range(n):
+        mask = np.arange(n) != i
+        res_i = OLS(endog[mask], exog[mask]).fit()
+        fitted_looo[i] = res_i.predict(exog[i : i + 1])[0]
+
+    assert_allclose(infl.fittedvalues_not_obsi, fitted_looo, rtol=1e-10)
+    assert_allclose(infl.resid_not_obsi, endog - fitted_looo, rtol=1e-10)
+    assert_allclose(infl.resid_not_obsi, infl.resid_press, rtol=1e-13)
+    # influence is the unscaled DFFIT, the change in the fitted value
+    assert_allclose(
+        infl.influence, res.fittedvalues - fitted_looo, rtol=1e-8, atol=1e-12
+    )
+
+
 def test_olsinfluence_ols_xnoti_and_get_drop_vari():
     from statsmodels.stats.outliers_influence import OLSInfluence
 
