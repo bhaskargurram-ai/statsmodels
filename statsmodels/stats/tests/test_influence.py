@@ -103,6 +103,16 @@ class InfluenceCompareExact:
             rtol=5e-9,
             atol=1e-14,
         )
+        # GH#9008: one-step leave-one-observation-out fitted values and resid
+        assert_allclose(
+            infl0.fittedvalues_not_obsi,
+            infl1.fittedvalues_not_obsi,
+            rtol=5e-9,
+            atol=1e-10,
+        )
+        assert_allclose(
+            infl0.resid_not_obsi, infl1.resid_not_obsi, rtol=5e-9, atol=1e-10
+        )
 
     @pytest.mark.smoke
     @pytest.mark.thread_unsafe(reason="Uses matplotlib")
@@ -151,6 +161,21 @@ def _check_looo(self):
     diff_params = results.params - res_looo["params"]
     assert_allclose(infl.d_params[mask_low], diff_params[mask_low], atol=0.05)
     assert_allclose(infl.params_one[mask_low], res_looo["params"][mask_low], rtol=0.01)
+
+    # GH#9008: one-step LOOO fitted values and residuals versus the
+    # prediction for observation i from the explicit refit without it
+    exog = results.model.exog
+    fitted_looo = np.array(
+        [
+            results.model.predict(params_i, exog[i : i + 1])[0]
+            for i, params_i in enumerate(res_looo["params"])
+        ]
+    )
+    resid_looo = np.asarray(results.model.endog) - fitted_looo
+    assert_allclose(
+        infl.fittedvalues_not_obsi[mask_low], fitted_looo[mask_low], atol=0.01
+    )
+    assert_allclose(infl.resid_not_obsi[mask_low], resid_looo[mask_low], atol=0.01)
 
 
 class TestInfluenceLogitGLMMLE(InfluenceCompareExact):
@@ -285,6 +310,15 @@ class TestInfluenceGaussianGLMOLS(InfluenceCompareExact):
         # assert_allclose(infl0.d_fittedvalues, infl1.d_fittedvalues, rtol=1e-9)
         assert_allclose(
             infl0.d_fittedvalues_scaled, infl1.dffits_internal[0], rtol=1e-9
+        )
+
+        # GH#9008: one-step LOOO values are exact in the linear model and
+        # agree with the closed form in OLSInfluence
+        assert_allclose(
+            infl0.fittedvalues_not_obsi, infl1.fittedvalues_not_obsi, rtol=1e-10
+        )
+        assert_allclose(
+            infl0.resid_not_obsi, infl1.resid_not_obsi, rtol=1e-10, atol=1e-10
         )
 
         # specific to linear link
@@ -459,6 +493,78 @@ def test_olsinfluence_looo_resid_fittedvalues():
     assert_allclose(
         infl.influence, res.fittedvalues - fitted_looo, rtol=1e-8, atol=1e-12
     )
+
+
+@pytest.mark.parametrize(
+    "case", ["glm_gaussian_varw", "glm_poisson_offset", "glm_binomial", "poisson"]
+)
+def test_mleinfluence_looo_resid_fittedvalues(case):
+    # GH#9008: one-step approximation to leave-one-observation-out fitted
+    # values and residuals in GLMInfluence and MLEInfluence. The reference
+    # values are computed by brute force: refit the model without
+    # observation i and predict observation i. The one-step values are exact
+    # in the linear Gaussian model and an approximation otherwise.
+    from statsmodels.discrete.discrete_model import Poisson
+
+    rng = np.random.default_rng(9008)
+    n = 60
+    exog = np.column_stack([np.ones(n), rng.standard_normal((n, 2))])
+    linpred = exog @ [0.5, 0.3, -0.2]
+    offset = rng.uniform(-0.5, 0.5, n)
+    var_weights = rng.uniform(0.5, 2, n)
+
+    def fit(mask):
+        if case == "glm_gaussian_varw":
+            mod = GLM(
+                endog[mask],
+                exog[mask],
+                family=families.Gaussian(),
+                var_weights=var_weights[mask],
+            )
+        elif case == "glm_poisson_offset":
+            mod = GLM(
+                endog[mask], exog[mask], family=families.Poisson(), offset=offset[mask]
+            )
+        elif case == "glm_binomial":
+            mod = GLM(endog[mask], exog[mask], family=families.Binomial())
+        else:
+            mod = Poisson(endog[mask], exog[mask], offset=offset[mask])
+            return mod.fit(method="newton", tol=1e-12, disp=False)
+        return mod.fit(tol=1e-12)
+
+    if case == "glm_gaussian_varw":
+        endog = linpred + rng.standard_normal(n) / np.sqrt(var_weights)
+    elif case == "glm_binomial":
+        endog = rng.binomial(1, 1 / (1 + np.exp(-2 * linpred))).astype(float)
+    else:
+        endog = rng.poisson(np.exp(linpred + offset)).astype(float)
+
+    res = fit(np.ones(n, dtype=bool))
+    infl = res.get_influence()
+    if case == "poisson":
+        assert type(infl) is MLEInfluence
+    else:
+        assert type(infl) is GLMInfluence
+
+    uses_offset = case in ("glm_poisson_offset", "poisson")
+    fitted_looo = np.empty(n)
+    for i in range(n):
+        mask = np.arange(n) != i
+        kwds = {"offset": offset[i : i + 1]} if uses_offset else {}
+        fitted_looo[i] = fit(mask).predict(exog[i : i + 1], **kwds)[0]
+    resid_looo = endog - fitted_looo
+
+    if case == "glm_gaussian_varw":
+        assert_allclose(infl.fittedvalues_not_obsi, fitted_looo, rtol=1e-10)
+        assert_allclose(infl.resid_not_obsi, resid_looo, rtol=1e-10, atol=1e-12)
+    else:
+        # the error of the one-step approximation is small relative to the
+        # change in the prediction caused by dropping the observation
+        change = np.asarray(res.predict()) - fitted_looo
+        atol = 0.1 * np.abs(change).max()
+        assert_allclose(infl.fittedvalues_not_obsi, fitted_looo, rtol=0, atol=atol)
+        assert_allclose(infl.resid_not_obsi, resid_looo, rtol=0, atol=atol)
+        assert np.corrcoef(infl.d_fittedvalues, change)[0, 1] > 0.99
 
 
 def test_olsinfluence_ols_xnoti_and_get_drop_vari():

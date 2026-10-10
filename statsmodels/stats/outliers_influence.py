@@ -459,6 +459,12 @@ class MLEInfluence(_BaseInfluenceMixin):
     params_one : ndarray
         is the one step parameter estimate computed as ``params``
         from the full sample minus ``d_params``.
+    fittedvalues_not_obsi : ndarray
+        one-step approximation to the leave-one-observation-out predicted
+        mean, ``results.predict()`` minus ``d_fittedvalues``.
+    resid_not_obsi : ndarray
+        one-step approximation to the leave-one-observation-out response
+        residual, ``results.model.endog`` minus ``fittedvalues_not_obsi``.
 
     Notes
     -----
@@ -762,6 +768,75 @@ class MLEInfluence(_BaseInfluenceMixin):
         # and not for a weighted response, i.e., not the self.exog, self.endog
         # this will be relevant for WLS comparing fitted endog versus wendog
         return self.d_fittedvalues / self._get_prediction.se
+
+    @cache_readonly
+    def fittedvalues_not_obsi(self):
+        r"""
+        Leave-one-observation-out (LOOO) fitted values, one-step approximation
+
+        Approximate predicted mean of observation i from the model estimated
+        without observation i.
+
+        Notes
+        -----
+        This uses the one-step approximation of the parameter change,
+        ``d_params``, and the implied local change in the predicted mean,
+        ``d_fittedvalues``:
+
+        .. math::
+
+           \hat\mu_{i,(i)} \approx \hat\mu_i -
+           \frac{\partial \mu_i}{\partial \beta'} \Delta\hat\beta_{(i)}
+
+        where :math:`\hat\mu_i` is the predicted mean, ``results.predict()``,
+        and :math:`\Delta\hat\beta_{(i)}` is row i of ``d_params``.
+
+        No LOOO loop is required. The values are an approximation to the
+        prediction from an explicit refit without observation i. They are
+        exact in linear models with identity link, e.g. GLM with Gaussian
+        family, where they agree with ``OLSInfluence.fittedvalues_not_obsi``.
+
+        References
+        ----------
+        Pregibon, D. (1981). Logistic regression diagnostics. The Annals of
+            Statistics, 9(4), 705-724.
+        Williams, D. A. (1987). Generalized linear model diagnostics using the
+            deviance and single case deletions. Journal of the Royal
+            Statistical Society, Series C, 36(2), 181-191.
+        """
+        fitted = np.asarray(self.results.predict())
+        return fitted - self.d_fittedvalues
+
+    @cache_readonly
+    def resid_not_obsi(self):
+        r"""
+        Leave-one-observation-out (LOOO) residuals, one-step approximation
+
+        Approximate response residual of observation i when the prediction
+        is based on the model estimated without observation i, also called
+        jackknife, deleted or predicted residuals.
+
+        Notes
+        -----
+        This is ``results.model.endog - fittedvalues_not_obsi``, which is the
+        response residual plus ``d_fittedvalues``:
+
+        .. math::
+
+           y_i - \hat\mu_{i,(i)} \approx (y_i - \hat\mu_i) +
+           \frac{\partial \mu_i}{\partial \beta'} \Delta\hat\beta_{(i)}
+
+        It is based on the one-step approximation ``d_params``. It is exact
+        in linear models with identity link, where it is equal to the
+        response residual divided by ``1 - hat_matrix_diag``.
+
+        In contrast to ``resid`` and ``resid_studentized``, which are based
+        on Pearson residuals by default, these residuals are on the scale of
+        the response and are not standardized.
+        """
+        # use the response, self.endog can be a weighted endog, e.g. in GLM
+        endog = np.asarray(self.results.model.endog)
+        return endog - self.fittedvalues_not_obsi
 
     def summary_frame(self):
         """
