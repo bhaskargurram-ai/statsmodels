@@ -235,6 +235,8 @@ def get_prediction(self, exog=None, transform=True, weights=None,
         var_resid /= weights
 
     dist = ["norm", "t"][self.use_t]
+    # same df as conf_int, e.g. n_groups - 1 with cluster robust cov_type
+    df = getattr(self, "df_resid_inference", self.df_resid)
     return PredictionResults(predicted_mean, var_pred_mean, var_resid,
-                             df=self.df_resid, dist=dist,
+                             df=df, dist=dist,
                              row_labels=row_labels)
