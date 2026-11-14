@@ -2494,6 +2494,7 @@ class OrdinalGEE(GEE):
         offset=None,
         dep_data=None,
         constraint=None,
+        weights=None,
         **kwargs,
     ):
 
@@ -2508,18 +2509,22 @@ class OrdinalGEE(GEE):
         endog, exog, groups, time, offset = self.setup_ordinal(
             endog, exog, groups, time, offset
         )
+        if weights is not None:
+            # one weight for each indicator row created by setup_ordinal
+            weights = np.repeat(np.asarray(weights), len(self.endog_values) - 1)
 
         super().__init__(
             endog,
             exog,
             groups,
-            time,
-            family,
-            cov_struct,
-            missing,
-            offset,
-            dep_data,
-            constraint,
+            time=time,
+            family=family,
+            cov_struct=cov_struct,
+            missing=missing,
+            offset=offset,
+            dep_data=dep_data,
+            constraint=constraint,
+            weights=weights,
         )
 
     def setup_ordinal(self, endog, exog, groups, time, offset):
@@ -2824,6 +2829,7 @@ class NominalGEE(GEE):
         offset=None,
         dep_data=None,
         constraint=None,
+        weights=None,
         **kwargs,
     ):
 
@@ -2837,17 +2843,22 @@ class NominalGEE(GEE):
         if cov_struct is None:
             cov_struct = cov_structs.NominalIndependence()
 
+        if weights is not None:
+            # one weight for each indicator row created by setup_nominal
+            weights = np.repeat(np.asarray(weights), self.ncut)
+
         super().__init__(
             endog,
             exog,
             groups,
-            time,
-            family,
-            cov_struct,
-            missing,
-            offset,
-            dep_data,
-            constraint,
+            time=time,
+            family=family,
+            cov_struct=cov_struct,
+            missing=missing,
+            offset=offset,
+            dep_data=dep_data,
+            constraint=constraint,
+            weights=weights,
         )
 
     def _starting_params(self):

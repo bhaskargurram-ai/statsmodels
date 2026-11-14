@@ -405,6 +405,10 @@ Generalized linear models and discrete models
   ``summary``, used the number of rows instead of the sum of the
   ``freq_weights``. With frequency weights the value differed from the value
   for the data with each row repeated according to its weight. :pr:`10684`
+- ``OrdinalGEE`` and ``NominalGEE`` ignored ``weights`` and ``constraint``
+  without a warning. ``weights`` was not passed on to ``GEE``, and the
+  remaining arguments were passed by position, so that ``constraint`` was
+  used as ``dep_data`` and ``dep_data`` as ``exposure``.
 
 Mixed models and imputation
 ---------------------------

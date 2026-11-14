@@ -2729,3 +2729,66 @@ def test_autoregressive_equal_objective():
     result = model.fit(scale=1.0, start_params=[1.0, 2.0, 3.0, 5.0])
     ar.update(result.params)
     assert ar.dep_params == 0.0
+
+
+def _ordinal_data(model_class):
+    rng = np.random.default_rng(3412)
+    n = 300
+    groups = np.repeat(np.arange(60), 5)
+    exog = rng.standard_normal((n, 2))
+    endog = np.digitize(exog @ [1.0, -0.5] + rng.logistic(size=n), [-1, 0.5, 2])
+    kwds = {}
+    if model_class is gee.NominalGEE:
+        # nominal models need an intercept, ordinal models must not have one
+        exog = np.column_stack([np.ones(n), exog])
+        # NominalIndependence converges slowly
+        kwds["cov_struct"] = cov_struct.Independence()
+    return endog, exog, groups, kwds, rng
+
+
+@pytest.mark.parametrize("model_class", [gee.OrdinalGEE, gee.NominalGEE])
+def test_ordinal_nominal_weights(model_class):
+    # integer case weights give the same fit as repeating each row
+    endog, exog, groups, kwds, rng = _ordinal_data(model_class)
+    weights = rng.integers(1, 4, size=endog.shape[0])
+    rep = np.repeat(np.arange(endog.shape[0]), weights)
+
+    fit_kwds = {"maxiter": 500, "ctol": 1e-10}
+    mod_w = model_class(endog, exog, groups, weights=weights, **kwds)
+    res_w = mod_w.fit(**fit_kwds)
+    mod_rep = model_class(endog[rep], exog[rep], groups[rep], **kwds)
+    res_rep = mod_rep.fit(**fit_kwds)
+    res_unw = model_class(endog, exog, groups, **kwds).fit(**fit_kwds)
+
+    assert_allclose(res_w.params, res_rep.params, rtol=1e-7, atol=1e-8)
+    assert_allclose(res_w.bse, res_rep.bse, rtol=1e-7, atol=1e-8)
+    assert np.max(np.abs(res_w.params - res_unw.params)) > 0.01
+
+
+@pytest.mark.parametrize("model_class", [gee.OrdinalGEE, gee.NominalGEE])
+def test_ordinal_nominal_constraint(model_class):
+    # constraining the coefficients of the last two columns to sum to zero
+    # gives the same fit as replacing them by their difference
+    endog, exog, groups, kwds, _ = _ordinal_data(model_class)
+    fit_kwds = {"maxiter": 500, "ctol": 1e-10}
+    exog_r = np.column_stack([exog[:, :-2], exog[:, -2] - exog[:, -1]])
+    res_r = model_class(endog, exog_r, groups, **kwds).fit(**fit_kwds)
+
+    # positions of the last two columns in the params of the full model
+    k = exog.shape[1]
+    if model_class is gee.OrdinalGEE:
+        idx = [[3 + k - 2, 3 + k - 1]]
+    else:
+        idx = [[j * k + k - 2, j * k + k - 1] for j in range(3)]
+    lhs = np.zeros((len(idx), len(res_r.params) + len(idx)))
+    for row, (i0, i1) in enumerate(idx):
+        lhs[row, [i0, i1]] = 1
+    constraint = (lhs, np.zeros(len(idx)))
+    res_c = model_class(endog, exog, groups, constraint=constraint, **kwds).fit(
+        **fit_kwds
+    )
+
+    keep = np.array([j for j in range(lhs.shape[1]) if j not in np.array(idx)[:, 1]])
+    assert_allclose(lhs @ res_c.params.to_numpy(), 0, atol=1e-12)
+    assert_allclose(res_c.params.to_numpy()[keep], res_r.params, rtol=1e-6)
+    assert_allclose(res_c.bse.to_numpy()[keep], res_r.bse, rtol=1e-6)
