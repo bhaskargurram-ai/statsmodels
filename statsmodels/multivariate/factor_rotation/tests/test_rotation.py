@@ -1,8 +1,11 @@
 import unittest
 
 import numpy as np
+from numpy.testing import assert_allclose
+import pytest
 
 from statsmodels.multivariate.factor_rotation._analytic_rotation import (
+    promax,
     target_rotation,
 )
 from statsmodels.multivariate.factor_rotation._gpa_rotation import (
@@ -643,3 +646,94 @@ class TestWrappers(unittest.TestCase):
             elif method == "partial_target":
                 method_args = [self.get_H(), self.get_W()]
             self._test_template(method, *method_args)
+
+
+def _align_columns(L, Phi, L_ref):
+    # Rotated factors are unique up to the order and the signs of the
+    # columns; align L and Phi to the reference
+    import itertools
+
+    m = L.shape[1]
+    best = None
+    for perm in itertools.permutations(range(m)):
+        signs = np.sign(np.sum(L[:, perm] * L_ref, axis=0))
+        La = L[:, perm] * signs
+        err = np.abs(La - L_ref).max()
+        if best is None or err < best[0]:
+            Pa = Phi[np.ix_(perm, perm)] * np.outer(signs, signs)
+            best = (err, La, Pa)
+    return best[1], best[2]
+
+
+PROMAX_A2 = np.array(
+    [[0.70, 0.35], [0.60, 0.42], [0.65, -0.30], [0.55, -0.38], [0.62, 0.25],
+     [0.58, -0.33]]
+)
+PROMAX_A3 = np.column_stack(
+    (
+        [0.72, 0.66, 0.61, 0.58, 0.69, 0.55, 0.63, 0.60, 0.57],
+        [0.30, 0.36, 0.28, -0.35, -0.29, -0.31, 0.05, 0.02, -0.04],
+        [0.10, -0.05, 0.08, 0.12, -0.02, 0.04, -0.41, -0.38, -0.45],
+    )
+)
+# R: stats::promax(A, m=k), with the varimax step run to convergence
+# (varimax(x, eps=1e-14) instead of the default eps=1e-5); the factor
+# correlation is tcrossprod(solve(rotmat)), as in factanal
+PROMAX_R = {
+    ("A2", 4): (
+        [0.760107539, -0.041778067, 0.773716943, 0.086801669, 0.069375627,
+         -0.677395171, -0.069760213, -0.702079735, 0.612140008, -0.098309151,
+         -0.001543619, -0.668108554],
+        [1.0, -0.519449959, -0.519449959, 1.0],
+    ),
+    ("A2", 3): (
+        [0.753186016, -0.057050311, 0.763983296, 0.069922301, 0.082744922,
+         -0.671842830, -0.054451900, -0.693398428, 0.607909973, -0.109941560,
+         0.012359458, -0.661186859],
+        [1.0, -0.488207802, -0.488207802, 1.0],
+    ),
+    ("A3", 4): (
+        [0.768107349, -0.087967432, 0.050773046, 0.692964273, 0.097068020,
+         -0.158780683, 0.675070004, -0.044001087, 0.036960347, 0.012277431,
+         -0.727937821, 0.078599152, 0.032640735, -0.631106125, -0.141401497,
+         -0.018174698, -0.621660174, -0.033184452, 0.084589902, 0.000463088,
+         -0.694134197, 0.058490309, -0.035520689, -0.646627918, -0.072056384,
+         -0.042339866, -0.747140244],
+        [1.0, -0.563444920, -0.672457181, -0.563444920, 1.0, 0.626540894,
+         -0.672457181, 0.626540894, 1.0],
+    ),
+}
+
+
+@pytest.mark.parametrize("name, k", list(PROMAX_R))
+def test_promax_r(name, k):
+    # GH-4172
+    A = {"A2": PROMAX_A2, "A3": PROMAX_A3}[name]
+    m = A.shape[1]
+    L_r, Phi_r = (np.array(x) for x in PROMAX_R[(name, k)])
+    L_r = L_r.reshape(-1, m)
+    Phi_r = Phi_r.reshape(m, m)
+
+    L, T = promax(A, k=k)
+    Phi = T.T.dot(T)
+    # The rotation is oblique: L = A (T')^{-1} and A A' = L Phi L'
+    assert_allclose(L, A.dot(np.linalg.inv(T.T)), atol=1e-12)
+    assert_allclose(L.dot(Phi).dot(L.T), A.dot(A.T), atol=1e-12)
+    assert_allclose(np.diag(Phi), np.ones(m), atol=1e-12)
+
+    L, Phi = _align_columns(L, Phi, L_r)
+    assert_allclose(L, L_r, atol=1e-5)
+    assert_allclose(Phi, Phi_r, atol=1e-5)
+
+
+def test_promax_default_power_and_options():
+    A = PROMAX_A2
+    L4, _ = promax(A)
+    L, _ = promax(A, k=4)
+    assert_allclose(L4, L)
+    # Without Kaiser normalization the result is a different, valid
+    # oblique rotation
+    L_nn, T_nn = promax(A, normalize=False)
+    assert_allclose(L_nn.dot(T_nn.T.dot(T_nn)).dot(L_nn.T), A.dot(A.T), atol=1e-12)
+    with pytest.raises(ValueError, match="k must be larger than 1"):
+        promax(A, k=1)

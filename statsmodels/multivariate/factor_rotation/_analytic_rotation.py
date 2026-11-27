@@ -102,58 +102,76 @@ def procrustes(A, H):
     return np.linalg.inv(A.T.dot(A)).dot(A.T).dot(H)
 
 
-def promax(A, k=2):
+def promax(A, k=4, normalize=True):
     r"""
     Performs promax rotation of the matrix :math:`A`.
 
-    This method was not very clear to me from the literature, this
-    implementation is as I understand it should work.
+    Promax rotation (Hendrickson and White, 1964) is performed in the
+    following steps:
 
-    Promax rotation is performed in the following steps:
+    * Determine varimax rotated loadings :math:`V`, with Kaiser normalization
+      if ``normalize`` is True.
 
-    * Determine varimax rotated patterns :math:`V`.
+    * Construct the target matrix :math:`H` with elements
+      :math:`V_{ij} |V_{ij}|^{k-1}`.
 
-    * Construct a rotation target matrix :math:`|V_{ij}|^k/V_{ij}`
+    * Regress the target on :math:`V` to obtain :math:`U` (least squares
+      Procrustes) and scale the columns of :math:`U` so that the factors
+      have unit variance.
 
-    * Perform procrustes rotation towards the target to obtain T
+    * The rotated loadings are the pattern matrix :math:`L = VU`.
 
-    * Determine the patterns
-
-    First, varimax rotation a target matrix :math:`H` is determined with
-    orthogonal varimax rotation.
-    Then, oblique target rotation is performed towards the target.
+    This is the algorithm of ``promax`` in R's stats package, which
+    ``factanal`` uses, with the same default power ``k=4``.
 
     Parameters
     ----------
     A : ndarray
         Non-rotated factors.
     k : float, optional
-        Power parameter, should be positive.
+        Power of the target, should be larger than 1. The default is 4.
+    normalize : bool, optional
+        If True (the default), the varimax rotation uses Kaiser
+        normalization, the rows of :math:`A` are scaled to unit length
+        before the rotation and scaled back afterwards.
 
     Returns
     -------
     ndarray
-        The rotated factors.
+        The rotated factors, the pattern matrix :math:`L`.
     ndarray
-        The rotation matrix :math:`T`.
+        The rotation matrix :math:`T`, such that :math:`L = A(T^*)^{-1}` and
+        the correlation of the rotated factors is :math:`T^*T`, as for the
+        oblique rotations of ``rotate_factors``.
 
     References
     ----------
-    [1] Browne (2001) - An overview of analytic rotation in exploratory
-    factor analysis
+    [1] Hendrickson, White (1964) - Promax: A quick method for rotation to
+    oblique simple structure
 
-    [2] Navarra, Simoncini (2010) - A guide to empirical orthogonal functions
-    for climate data analysis
+    [2] Browne (2001) - An overview of analytic rotation in exploratory
+    factor analysis
     """
-    assert k > 0
-    # define rotation target using varimax rotation:
+    if k <= 1:
+        raise ValueError("k must be larger than 1")
+    A = np.asarray(A, dtype=np.float64)
+    # Varimax rotation, V = A R with R orthogonal
     from ._wrappers import rotate_factors
-    V, T = rotate_factors(A, "varimax")
-    H = np.abs(V)**k/V
-    # solve procrustes problem
-    S = procrustes(A, H)  # np.linalg.inv(A.T.dot(A)).dot(A.T).dot(H);
-    # normalize
-    d = np.sqrt(np.diag(np.linalg.inv(S.T.dot(S))))
-    D = np.diag(d)
-    T = np.linalg.inv(S.dot(D)).T
-    return A.dot(T), T
+
+    if normalize:
+        h = np.sqrt((A**2).sum(1))[:, None]
+        h[h == 0] = 1
+        V, R = rotate_factors(A / h, "varimax")
+        V = V * h
+    else:
+        V, R = rotate_factors(A, "varimax")
+    # Target and least squares rotation towards it
+    H = V * np.abs(V) ** (k - 1)
+    U = procrustes(V, H)
+    # Scale the columns so that the factors have unit variance
+    d = np.sqrt(np.diag(np.linalg.inv(U.T.dot(U))))
+    U = U * d
+    L = V.dot(U)
+    # L = A R U = A (T^*)^{-1}
+    T = np.linalg.inv(R.dot(U)).T
+    return L, T

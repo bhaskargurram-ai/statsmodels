@@ -376,3 +376,29 @@ def test_ml_loadings_are_real():
     x = factors @ load.T + rng.standard_normal((500, 6))
     res = Factor(x, 2, method="ml").fit()
     assert not np.iscomplexobj(res.loadings)
+
+
+def test_rotate_promax_r():
+    # GH-4172: promax returned the varimax loadings and an identity factor
+    # correlation. R, with the unrotated loadings `a` of
+    # test_example_compare_to_R_output and stats::promax with the varimax
+    # step run to convergence (varimax(x, eps=1e-14)):
+    #   p <- promax(a); tm <- solve(p$rotmat); tm %*% t(tm)
+    mod = Factor(X.iloc[:, 1:-1], 2, smc=False)
+    results = mod.fit(tol=1e-10)
+    results.rotate("promax")
+    loadings_r = np.array(
+        [
+            [1.016009658, 0.071855434],
+            [1.010706922, 0.057517614],
+            [0.856836767, -0.162816133],
+            [-0.036779947, -1.009765145],
+        ]
+    )
+    assert_allclose(results.loadings, loadings_r, atol=1e-5)
+    corr_f = results._corr_factors()
+    assert_allclose(corr_f, [[1, -0.372810959], [-0.372810959, 1]], atol=1e-5)
+    # The oblique rotation keeps the common part of the covariance
+    L0 = results.loadings_no_rot
+    L = results.loadings
+    assert_allclose(L.dot(corr_f).dot(L.T), L0.dot(L0.T), atol=1e-10)

@@ -739,9 +739,14 @@ class FactorResults:
 
         Notes
         -----
-        Warning: 'varimax', 'quartimax' and 'oblimin' are verified against R or
-        Stata. Some rotation methods such as promax do not produce the same
+        Warning: 'varimax', 'quartimax', 'oblimin' and 'promax' are verified
+        against R or Stata. Other rotation methods may not produce the same
         results as the R or Stata default functions.
+
+        'promax' is the promax rotation of R's ``factanal``: power 4 and a
+        Kaiser normalized varimax rotation as starting point, see
+        :func:`statsmodels.multivariate.factor_rotation.promax`. The
+        loadings are the pattern matrix.
 
         See Also
         --------
