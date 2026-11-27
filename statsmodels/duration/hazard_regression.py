@@ -1458,12 +1458,13 @@ class PHReg(model.LikelihoodModel):
 
         Notes
         -----
-        Uses the Nelson-Aalen estimator.
+        The cumulative hazard is the Breslow estimator, or with
+        ``ties="efron"`` its Efron version, evaluated at each failure time
+        so that it includes the jump at that time. This is the estimator of
+        ``survfit.coxph`` in R's survival package.
         """
 
-        # TODO: some disagreements with R, not the same algorithm but
-        # hard to deduce what R is doing.  Our results are reasonable.
-
+        efron = self.ties == "efron"
         surv = self.surv
         rslt = []
 
@@ -1492,13 +1493,21 @@ class PHReg(model.LikelihoodModel):
 
                 # Account for all cases that fail at this point.
                 ix = uft_ix[i]
-                h0[i] = len(ix) / xp0
+                ndeath = len(ix)
+                if efron and ndeath > 1:
+                    # Efron: the tied failures leave the risk set in
+                    # ndeath equal steps.
+                    xp0d = e_linpred[ix].sum()
+                    f = np.arange(ndeath, dtype=np.float64) / ndeath
+                    h0[i] = np.sum(1 / (xp0 - f * xp0d))
+                else:
+                    h0[i] = ndeath / xp0
 
                 # Update for cases leaving the risk set.
                 ix = surv.risk_exit[stx][i]
                 xp0 -= e_linpred[ix].sum()
 
-            cumhaz = np.cumsum(h0) - h0
+            cumhaz = np.cumsum(h0)
             current_strata_surv = np.exp(-cumhaz)
             rslt.append([uft, cumhaz, current_strata_surv])
 
@@ -1530,8 +1539,9 @@ class PHReg(model.LikelihoodModel):
         for stx in range(surv.nstrat):
             time_h = base[stx][0]
             cumhaz = base[stx][1]
+            # The cumulative hazard is 0 before the first failure time
             time_h = np.r_[-np.inf, time_h, np.inf]
-            cumhaz = np.r_[cumhaz[0], cumhaz, cumhaz[-1]]
+            cumhaz = np.r_[0.0, cumhaz, cumhaz[-1]]
             func = interp1d(time_h, cumhaz, kind="zero")
             cumhaz_f[self.surv.stratum_names[stx]] = func
 
@@ -1699,8 +1709,12 @@ class PHReg(model.LikelihoodModel):
             pts = bhaz[stx][0]
 
             # The individual cumulative hazards for everyone in this
-            # stratum.
-            ichaz = np.outer(e_linpred, bhaz[stx][1])
+            # stratum, just before each failure time, so that the mass at
+            # a failure time is the drop of the survival function there
+            # and the mass that remains after the last failure time is put
+            # on it.
+            cumhaz_left = np.r_[0.0, bhaz[stx][1][:-1]]
+            ichaz = np.outer(e_linpred, cumhaz_left)
 
             # The individual survival functions.
             usurv = np.exp(-ichaz)

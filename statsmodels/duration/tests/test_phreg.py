@@ -315,8 +315,11 @@ class TestPHReg:
 
         bc_haz = rslt.baseline_cumulative_hazard
         v = [np.mean(np.abs(x)) for x in bc_haz[0]]
-        w = np.r_[23.482841556421608, 0.44149255358417017, 0.68660114081275281]
-        assert_allclose(v, w)
+        # R: s <- summary(survfit(fit, newdata=data.frame(a=0, b=0, c=0, d=0)),
+        #                 censored=FALSE); mean(s$time), mean(s$cumhaz),
+        #                 mean(s$surv)
+        w = np.r_[23.482841556421608, 0.461480058311982, 0.678245114117185]
+        assert_allclose(v, w, rtol=1e-10)
 
         score_resid = rslt.score_residuals
         v = np.r_[0.50924792, 0.4533952, 0.4876718, 0.5441128]
@@ -737,3 +740,93 @@ def test_known_init_kwargs_no_warning():
         for m in (mod, mod_f):
             PHReg(m.endog, m.exog, **m._get_init_kwds())
             m.fit_regularized(alpha=0.05, refit=True)
+
+
+def _baseline_hazard_data():
+    # Failure times on a grid of 1/8 so that there are ties; the entry
+    # times are off the grid, where the risk sets of statsmodels and R agree
+    rs = np.random.RandomState(5432)
+    n = 80
+    x1 = rs.normal(size=n)
+    x2 = rs.binomial(1, 0.5, size=n).astype(np.float64)
+    time = np.ceil(rs.exponential(np.exp(-0.5 * x1 + 0.3 * x2)) * 8) / 8
+    status = rs.binomial(1, 0.75, size=n).astype(np.float64)
+    entry = np.floor(rs.uniform(0, 0.6, size=n) * time * 8) / 8 + 1 / 16
+    strata = np.repeat([0, 1], n // 2)
+    offset = 0.2 * rs.normal(size=n)
+    exog = np.column_stack((x1, x2))
+    return time, status, exog, entry, strata, offset
+
+
+# R survival 3.5.8: survfit(coxph(...), newdata=data.frame(x1=0, x2=0,
+# offset=0)), cumulative hazard at the first, the middle and the last failure
+# time of each stratum
+BASELINE_CUMHAZ_R = {
+    ("plain", "breslow"): [
+        [(0.125, 0.0341353190178), (2.125, 0.682645036224), (16.5, 10.0020812747)]
+    ],
+    ("plain", "efron"): [
+        [(0.125, 0.0348228730505), (2.125, 0.699582671683), (16.5, 10.4068720607)]
+    ],
+    ("full", "breslow"): [
+        [(0.125, 0.0755897248781), (1.5, 1.07192924254), (16.5, 6.76262507583)],
+        [(0.125, 0.135127613263), (2.0, 0.814415004493), (12.0, 4.51344448635)],
+    ],
+    ("full", "efron"): [
+        [(0.125, 0.0749621112144), (1.5, 1.14711296857), (16.5, 7.05120400531)],
+        [(0.125, 0.146527081435), (2.0, 0.838837747918), (12.0, 4.61543270727)],
+    ],
+}
+
+
+@pytest.mark.parametrize("case, ties", list(BASELINE_CUMHAZ_R))
+def test_baseline_cumulative_hazard_r(case, ties):
+    # The baseline cumulative hazard includes the jump at each failure time
+    # and uses the Efron increments for ties="efron" (GH-8518)
+    time, status, exog, entry, strata, offset = _baseline_hazard_data()
+    kwds = {"ties": ties}
+    if case == "full":
+        kwds.update(entry=entry, strata=strata, offset=offset)
+    rslt = PHReg(time, exog, status, **kwds).fit()
+    base = rslt.baseline_cumulative_hazard
+    expected = BASELINE_CUMHAZ_R[(case, ties)]
+    assert len(base) == len(expected)
+    for (time_h, cumhaz, surv), exp in zip(base, expected, strict=True):
+        idx = [0, len(time_h) // 2, len(time_h) - 1]
+        assert_allclose(time_h[idx], [t for t, _ in exp])
+        assert_allclose(cumhaz[idx], [h for _, h in exp], rtol=1e-9)
+        assert_allclose(surv, np.exp(-cumhaz))
+
+    # The function form is 0 before the first failure time and steps at each
+    # failure time
+    bfunc = rslt.baseline_cumulative_hazard_function
+    for k, (time_h, cumhaz, _) in enumerate(base):
+        func = bfunc[rslt.model.surv.stratum_names[k]]
+        assert_allclose(func(time_h[0] / 2), 0)
+        assert_allclose(func(time_h), cumhaz)
+        assert_allclose(func(time_h[-1] + 1), cumhaz[-1])
+
+
+@pytest.mark.parametrize(
+    "ties, surv_r",
+    [
+        (
+            "breslow",
+            [1.0, 0.923922268404, 0.529171505363, 0.419553353485, 0.159160615087],
+        ),
+        (
+            "efron",
+            [1.0, 0.921403265444, 0.516496360281, 0.405291138026, 0.148276775781],
+        ),
+    ],
+)
+def test_predict_survival_r(ties, surv_r):
+    # R: summary(survfit(fit, newdata=data.frame(x1=0.5, x2=1)),
+    #            times=c(0.05, 0.125, 1.0, 1.3, 2.5))$surv
+    time, status, exog, _, _, _ = _baseline_hazard_data()
+    rslt = PHReg(time, exog, status, ties=ties).fit()
+    times = np.r_[0.05, 0.125, 1.0, 1.3, 2.5]
+    pred = rslt.predict(
+        exog=np.tile([0.5, 1.0], (len(times), 1)), endog=times, pred_type="surv"
+    )
+    assert_allclose(pred.predicted_values, surv_r, rtol=1e-9)
